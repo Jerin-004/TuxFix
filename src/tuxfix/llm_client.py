@@ -1,0 +1,197 @@
+"""
+TuxFix LLM client — Ollama provider with demo-mode fallback.
+
+Design:
+- Provider abstraction: BaseLLMProvider interface makes swapping providers straightforward.
+- OllamaProvider: calls the local Ollama REST API.
+- DemoProvider: returns clearly-labelled pre-canned responses (never pretends to be real LLM).
+- All errors are surfaced as LLMError with human-readable messages.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Optional
+
+import requests
+
+from .config import TuxFixConfig, get_config
+
+logger = logging.getLogger(__name__)
+
+
+class LLMError(Exception):
+    """Raised when the LLM call fails."""
+    pass
+
+
+@dataclass
+class LLMResponse:
+    """Structured response from any LLM provider."""
+    text: str
+    model: str
+    provider: str
+    latency_seconds: float
+    token_count: Optional[int] = None
+    prompt_token_count: Optional[int] = None
+    is_demo: bool = False
+    raw_response: dict = field(default_factory=dict)
+
+
+class BaseLLMProvider(ABC):
+    """Abstract LLM provider interface."""
+
+    @abstractmethod
+    def generate(self, prompt: str, system_prompt: str = "") -> LLMResponse:
+        """Generate a response for the given prompt."""
+        ...
+
+    @abstractmethod
+    def is_available(self) -> bool:
+        """Return True if the provider is reachable."""
+        ...
+
+    @abstractmethod
+    def list_models(self) -> list[str]:
+        """Return available model names."""
+        ...
+
+
+class OllamaProvider(BaseLLMProvider):
+    """Ollama local inference provider."""
+
+    def __init__(self, config: Optional[TuxFixConfig] = None) -> None:
+        self.config = config or get_config()
+
+    def is_available(self) -> bool:
+        try:
+            resp = requests.get(
+                self.config.ollama_api_tags,
+                timeout=5,
+            )
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def list_models(self) -> list[str]:
+        try:
+            resp = requests.get(self.config.ollama_api_tags, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            return [m["name"] for m in data.get("models", [])]
+        except requests.RequestException as e:
+            logger.warning("Could not list Ollama models: %s", e)
+            return []
+
+    def generate(self, prompt: str, system_prompt: str = "") -> LLMResponse:
+        payload: dict = {
+            "model": self.config.ollama_model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.2,
+                "top_p": 0.9,
+                "num_predict": 2048,
+            },
+        }
+        if system_prompt:
+            payload["system"] = system_prompt
+
+        start = time.monotonic()
+        try:
+            resp = requests.post(
+                self.config.ollama_api_generate,
+                json=payload,
+                timeout=self.config.ollama_timeout,
+            )
+        except requests.ConnectionError as e:
+            raise LLMError(
+                f"Cannot connect to Ollama at {self.config.ollama_base_url}. "
+                f"Ensure Ollama is running (`ollama serve`). Detail: {e}"
+            ) from e
+        except requests.Timeout:
+            raise LLMError(
+                f"Ollama request timed out after {self.config.ollama_timeout}s. "
+                "Try increasing OLLAMA_TIMEOUT or using a smaller model."
+            )
+        except requests.RequestException as e:
+            raise LLMError(f"Ollama request failed: {e}") from e
+
+        latency = time.monotonic() - start
+
+        if resp.status_code != 200:
+            try:
+                detail = resp.json().get("error", resp.text[:200])
+            except Exception:
+                detail = resp.text[:200]
+            raise LLMError(
+                f"Ollama returned HTTP {resp.status_code}: {detail}. "
+                "Check that the model is installed (`ollama list`)."
+            )
+
+        try:
+            data = resp.json()
+        except json.JSONDecodeError as e:
+            raise LLMError(f"Ollama returned non-JSON response: {e}") from e
+
+        text = data.get("response", "")
+        if not text:
+            raise LLMError("Ollama returned an empty response.")
+
+        return LLMResponse(
+            text=text,
+            model=data.get("model", self.config.ollama_model),
+            provider="ollama",
+            latency_seconds=latency,
+            token_count=data.get("eval_count"),
+            prompt_token_count=data.get("prompt_eval_count"),
+            raw_response=data,
+        )
+
+
+class DemoProvider(BaseLLMProvider):
+    """
+    Demo provider — returns clearly labelled pre-canned responses.
+    NEVER claims to be a real LLM. Used when Ollama is unavailable.
+    """
+
+    DEMO_LABEL = (
+        "[DEMO MODE — This response was NOT generated by a real LLM. "
+        "It is a pre-written example for demonstration purposes only.]"
+    )
+
+    def __init__(self) -> None:
+        from .demo import get_demo_response
+        self._get_demo = get_demo_response
+
+    def is_available(self) -> bool:
+        return True
+
+    def list_models(self) -> list[str]:
+        return ["demo-model (pre-canned responses only)"]
+
+    def generate(self, prompt: str, system_prompt: str = "") -> LLMResponse:
+        text = self._get_demo(prompt)
+        return LLMResponse(
+            text=text,
+            model="demo",
+            provider="demo",
+            latency_seconds=0.1,
+            is_demo=True,
+        )
+
+
+def get_provider(config: Optional[TuxFixConfig] = None) -> BaseLLMProvider:
+    """
+    Return the appropriate provider based on config.
+    If demo_mode=True, always return DemoProvider.
+    Otherwise try Ollama; fall back gracefully (caller decides whether to use Demo).
+    """
+    cfg = config or get_config()
+    if cfg.demo_mode:
+        logger.info("Demo mode enabled — using DemoProvider.")
+        return DemoProvider()
+    return OllamaProvider(config=cfg)
